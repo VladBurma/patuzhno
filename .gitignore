@@ -1,0 +1,6 @@
+# секрети й особисті дані — ніколи не публікувати
+cloud/.env
+server.url
+build.log
+app/*.icns.bak
+.DS_Store
