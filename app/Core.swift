@@ -77,14 +77,15 @@ func lanIP() -> String? {
 // MARK: AES-CBC (вхід у Wonderfree і локальний канал станції)
 
 func aesCBC(_ data: Data, key: Data, iv: Data, encrypt: Bool) -> Data? {
-    var out = Data(count: data.count + kCCBlockSizeAES128)
+    let outLen = data.count + kCCBlockSizeAES128
+    var out = Data(count: outLen)
     var moved = 0
     let status = out.withUnsafeMutableBytes { o in
         data.withUnsafeBytes { d in
             key.withUnsafeBytes { k in
                 iv.withUnsafeBytes { v in
                     CCCrypt(CCOperation(encrypt ? kCCEncrypt : kCCDecrypt), CCAlgorithm(kCCAlgorithmAES), CCOptions(kCCOptionPKCS7Padding),
-                            k.baseAddress, key.count, v.baseAddress, d.baseAddress, data.count, o.baseAddress, out.count, &moved)
+                            k.baseAddress, key.count, v.baseAddress, d.baseAddress, data.count, o.baseAddress, outLen, &moved)
                 }
             }
         }
