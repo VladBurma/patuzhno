@@ -60,7 +60,7 @@ function rowToUser(r) { if (!r) return null; const d = JSON.parse(r.data || "{}"
 async function userByKey(env, key) { return key ? rowToUser(await env.DB.prepare("SELECT * FROM users WHERE key=?").bind(key).first()) : null; }
 async function userById(env, id) { return rowToUser(await env.DB.prepare("SELECT * FROM users WHERE id=?").bind(id).first()); }
 async function saveUser(env, u) {
-  const { id, key, dk, _refreshed, _resp_len, ...data } = u;
+  const { id, key, dk, _refreshed, _resp_len, _prevOut, ...data } = u;
   await env.DB.prepare("UPDATE users SET data=?, dk=? WHERE id=?").bind(JSON.stringify(data), (u.device && u.device.dk) || dk || null, id).run();
 }
 // запис лише вказаних полів поверх свіжої копії з бази: запит панелі чи програми не повинен
@@ -292,7 +292,7 @@ async function handleTelegram(env, req, url) {
 // ---------- збір (щохвилини, для всіх користувачів) ----------
 // запис результатів хвилинного циклу: перечитуємо рядок і змінюємо лише поля, якими володіє цикл
 // (поки цикл працював ~30 с, користувач міг прив'язати Telegram, змінити групу чи увійти знову)
-const TICK_FIELDS = ["live", "grid", "events", "health", "alerts", "hf_ts", "last_error", "stats", "device"];
+const TICK_FIELDS = ["live", "grid", "events", "health", "alerts", "hf_ts", "last_error", "stats", "device", "hold"];
 async function saveTick(env, u) {
   const f = await userById(env, u.id); if (!f) return;
   for (const k of TICK_FIELDS) { if (u[k] === undefined) delete f[k]; else f[k] = u[k]; }
@@ -302,7 +302,8 @@ async function saveTick(env, u) {
 
 async function tickUser(env, u, samples, idx) {
   const now = Date.now() / 1000, c = cfgOf(u);
-  const rows = [], prevTs = (u.live && u.live.updated) || 0;
+  const rows = [], prevTs = (u.live && u.live.updated) || 0, held = u.hold || null;   // притриманий з минулого циклу стрибок
+  u._prevOut = u.live && u.live.state ? Math.max(u.live.state.out_w || 0, u.live.state.in_w || 0) : null;   // попередній «нормальний» вимір
   try {
     // часті звіти: розносимо користувачів по різних хвилинах, щоб не впертись у ліміт запитів за запуск
     if (!u.hf_ts || (now - u.hf_ts > 170 && (Math.floor(now / 60) + idx) % 3 === 0) || now - u.hf_ts > 400) { if (await send(env, u, { high_frequency_reporting: "3" })) u.hf_ts = now; }
@@ -311,15 +312,32 @@ async function tickUser(env, u, samples, idx) {
       const { s, newest } = await readOnce(env, u);
       const nowR = Date.now() / 1000, online = !newest || nowR - newest < 600;
       const ts = Math.floor(newest && newest < nowR ? Math.max(newest, nowR - 60) : nowR);   // час самих даних, а не запиту
+      // одиничні викиди вимірювача (кидок струму при старті приладу або збій прошивки: 4–6 кВт на один вимір між
+      // звичайними 200 Вт) псують графіки, пік доби й дають хибні тривоги. Понад 2600 Вт станція віддати не може — відкидаємо
+      // одразу; різкий стрибок (у 4+ разів і на 1200+ Вт) притримуємо на один вимір і пишемо, лише якщо наступний його підтвердить
+      const outW = s.out_w ?? 0, inW = s.in_w ?? 0, lvl = Math.max(outW, inW);
+      const impossible = lvl > 2600;
+      const row = [u.id, ts, s.soc, outW, inW, s.temp ?? 0];
+      if (u.hold) {   // притриманий стрибок: підтверджено, якщо навантаження лишилось високим
+        if (!impossible && lvl > Math.max(u.hold[3], u.hold[4]) * 0.5 && lvl > 1200) { rows.push(u.hold); u._prevOut = Math.max(u.hold[3], u.hold[4]); }
+        delete u.hold;
+      }
+      const jump = !impossible && lvl > 1500 && u._prevOut != null && lvl > u._prevOut * 4 && lvl - u._prevOut > 1200;
+      if (impossible || jump) {
+        if (jump && online && s.soc != null) u.hold = row;
+        if (u.live && u.live.state) { s.out_w = u.live.state.out_w; s.in_w = u.live.state.in_w; s.ac_out_w = u.live.state.ac_out_w; }   // на панелі — попереднє значення
+      } else {
+        u._prevOut = lvl;
+        if (online && s.soc != null) rows.push(row);
+      }
       u.live = { state: s, updated: ts, online, station_ts: newest, rl: u._resp_len };
-      if (online && s.soc != null) rows.push([u.id, ts, s.soc, s.out_w ?? 0, s.in_w ?? 0, s.temp ?? 0]);
       if (i < samples - 1) await new Promise(r => setTimeout(r, Math.max(0, 25000 - (Date.now() - t0))));
     }
     delete u.last_error;
   } catch (e) { u.last_error = { ts: now, msg: String(e.message || e) }; }
   if (rows.length) {
     // повтори тієї ж відповіді станції відкидаємо ще до запису — тоді виміри й погодинні підсумки пишуться одним пакетом
-    const seen = new Set(), fresh = rows.filter(r => r[1] > prevTs && !seen.has(r[1]) && seen.add(r[1]));
+    const seen = new Set(), fresh = rows.filter(r => (r === held || r[1] > prevTs) && !seen.has(r[1]) && seen.add(r[1]));
     if (fresh.length) await env.DB.batch(fresh.flatMap(([uid, ts, soc, out, inw, temp]) => { const ch = inw - out > 100;
       return [env.DB.prepare("INSERT OR IGNORE INTO samples2 (uid, ts, soc, out, inw, temp) VALUES (?, ?, ?, ?, ?, ?)").bind(uid, ts, soc, out, inw, temp),
               env.DB.prepare(HOURLY_UPSERT).bind(uid, Math.floor(ts / 3600) * 3600, out, out, ch ? 1 : 0, ch ? inw - out : 0)]; }));

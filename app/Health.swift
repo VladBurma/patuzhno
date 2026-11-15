@@ -64,7 +64,9 @@ extension Engine {
         let week = history.filter { $0.ts > now - 7 * 86400 }
         let temp = s["temp"] as? Double
         let temps24 = day.map { $0.temp }.filter { $0 != 0 }
-        let peak24 = day.map { $0.out }.max() ?? 0
+        // пік доби — лише те, що трималось хоча б два виміри поспіль (одиничні викиди вимірювача не рахуємо)
+        var peak24 = 0.0
+        for i in 1..<max(1, day.count) where day[i].out <= 2600 { peak24 = max(peak24, min(day[i].out, day[i - 1].out)) }
         let fullShare = week.isEmpty ? 0 : Double(week.filter { $0.soc >= 99.5 }.count) / Double(week.count)
         let cycles = h.dischargedPct / 100
         let days = max(1, (now - h.since) / 86400)

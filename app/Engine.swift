@@ -42,6 +42,8 @@ final class Engine {
     private var lastSaved: [String: String] = [:]
     private var analyticsCache: (Double, [String: Any]?) = (0, nil)
     var lastCloudLogged: Double = 0
+    private var lastGoodW: Double? = nil      // останній нормальний вимір (фільтр викидів)
+    private var heldSample: Sample? = nil      // притриманий різкий стрибок — чекає підтвердження
     private var mwCache: (Double, [String: (w: Double, history: Bool, n: Int)])? = nil
     private var chargeCache: (Double, Double?)? = nil
     var historyHandle: FileHandle?
@@ -336,6 +338,7 @@ final class Engine {
             let p = line.trimmingCharacters(in: .whitespaces).split(separator: ",", omittingEmptySubsequences: false)
             guard p.count >= 6, let ts = Double(p[0]), let soc = Double(p[1]), let o = Double(p[2]), let i = Double(p[3]) else { continue }
             if ts < cutoff { continue }
+            if max(o, i) > 2600 { continue }   // неможливі значення зі старих записів (одиничні викиди вимірювача)
             history.append(Sample(ts: ts, soc: soc, out: o, inW: i, temp: Double(p[4]) ?? 0, mode: String(p[5]).trimmingCharacters(in: .whitespacesAndNewlines)))
             trackGrid(ts, i, o)
         }
@@ -365,14 +368,31 @@ final class Engine {
                 lastCloudLogged = cu; ts = cu
             }
             let s = Sample(ts: ts, soc: soc, out: out, inW: (state["in_w"] as? Double) ?? 0, temp: (state["temp"] as? Double) ?? 0, mode: modeAt(Date()))
-            history.append(s)
-            trackGrid(s.ts, s.inW, s.out)
-            updateHealth(ts: s.ts, soc: s.soc, out: s.out, temp: state["temp"] as? Double)
-            if history.count > 30 * 8640 { history.removeFirst(history.count - 30 * 8640) }
-            let line = "\(Int(s.ts)),\(s.soc),\(s.out),\(s.inW),\(s.temp),\(s.mode)\n"
-            historyHandle?.write(line.data(using: .utf8)!)
+            // одиничні викиди вимірювача (4–6 кВт на один вимір між звичайними 200 Вт) не пишемо: понад 2600 Вт станція
+            // віддати не може; різкий стрибок притримуємо на один вимір і пишемо, лише якщо наступний його підтвердить
+            let lvl = max(s.out, s.inW)
+            let impossible = lvl > 2600
+            if let h = heldSample {
+                heldSample = nil
+                if !impossible && lvl > max(h.out, h.inW) * 0.5 && lvl > 1200 { appendSample(h); lastGoodW = max(h.out, h.inW) }
+            }
+            let jump = !impossible && lvl > 1500 && lastGoodW != nil && lvl > lastGoodW! * 4 && lvl - lastGoodW! > 1200
+            if impossible || jump { if jump { heldSample = s }; lock.unlock(); continue }
+            lastGoodW = lvl
+            appendSample(s)
             lock.unlock()
+            continue
         }
+    }
+
+    /// Записує вимір в історію, події, здоров'я та файл (викликати під lock).
+    private func appendSample(_ s: Sample) {
+        history.append(s)
+        trackGrid(s.ts, s.inW, s.out)
+        updateHealth(ts: s.ts, soc: s.soc, out: s.out, temp: state["temp"] as? Double)
+        if history.count > 30 * 8640 { history.removeFirst(history.count - 30 * 8640) }
+        let line = "\(Int(s.ts)),\(s.soc),\(s.out),\(s.inW),\(s.temp),\(s.mode)\n"
+        historyHandle?.write(line.data(using: .utf8)!)
     }
 
     func modeWatts() -> [String: (w: Double, history: Bool, n: Int)] {
